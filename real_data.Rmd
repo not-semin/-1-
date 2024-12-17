@@ -1,0 +1,613 @@
+---
+title: "Untitled"
+author: "2024311134 안세민"
+date: "2024-12-12"
+output: html_document
+---
+
+**Packages**
+```{r warning=FALSE, message=FALSE}
+library(MASS)
+library(dplyr)
+library(survival)
+library(reshape2)
+library(ggplot2)
+```
+
+**Data**
+```{r warning=FALSE, message=FALSE}
+data <- read.csv("/Users/semin/Desktop/YONSEI/Lecture/2024_2/STA9050_응용통계학특수문제1/기말대체과제/real_data/mimic3_final.csv")
+str(data)
+
+table(data$Glascow.coma.scale.eye.opening)
+table(data$Glascow.coma.scale.verbal.response)
+table(data$delta)
+
+#data <- data %>%
+#  filter(Glascow.coma.scale.eye.opening %in% c(1, 2, 3, 4)) %>%
+#  filter(Glascow.coma.scale.verbal.response %in% c(1, 2, 3, 4, 5))
+
+#table(data$Glascow.coma.scale.eye.opening)
+#table(data$Glascow.coma.scale.verbal.response)
+#table(data$delta)
+
+data <- data %>% select(-Glascow.coma.scale.eye.opening, -Glascow.coma.scale.verbal.response)
+
+remove_outliers_sd <- function(data, col, n = 3) {
+  mean_value <- mean(data[[col]], na.rm = TRUE)
+  sd_value <- sd(data[[col]], na.rm = TRUE)
+  data <- data %>% filter(data[[col]] >= (mean_value - n * sd_value) & data[[col]] <= (mean_value + n * sd_value))
+  return(data)
+}
+
+# 사용 예시'
+data <- remove_outliers_sd(data, col = "futime", n = 3)
+data <- remove_outliers_sd(data, col = "Glucose", n = 3)
+data <- remove_outliers_sd(data, col = "Heart.Rate", n = 3)
+data <- remove_outliers_sd(data, col = "Height", n = 3)
+data <- remove_outliers_sd(data, col = "Mean.blood.pressure", n = 3)
+data <- remove_outliers_sd(data, col = "Oxygen.saturation", n = 3)
+data <- remove_outliers_sd(data, col = "Respiratory.rate", n = 3)
+data <- remove_outliers_sd(data, col = "Temperature", n = 3)
+data <- remove_outliers_sd(data, col = "Weight", n = 3)
+
+result <- data.frame(
+  Mean = round(sapply(data, function(x) mean(x, na.rm = TRUE)), 4),
+  SD = round(sapply(data, function(x) sd(x, na.rm = TRUE)), 4)
+)
+
+# 결과 출력
+print(result)
+
+delta1 <- data %>% filter(delta == 1)
+delta0 <- data %>% filter(delta == 0)
+
+summary(delta1$Glucose)
+summary(delta0$Glucose) 
+
+correlation_data <- data %>%
+  select(Glucose, Heart.Rate, Height, Mean.blood.pressure, Oxygen.saturation, 
+         Respiratory.rate, Temperature, Weight)
+cor_matrix <- cor(correlation_data, use = "complete.obs")
+# 상관계수 행렬 변환
+cor_data <- melt(cor_matrix)
+
+ggplot(cor_data, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 5) +  # 상관계수 표시
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, 
+                       limit = c(-1, 1), space = "Lab", name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(x = "Variables", y = "Variables", title = "Correlation Heatmap")
+
+table(data$delta)
+```
+futime: ICU 입원과 퇴원 시점 간의 기간(정확한 퇴원 시간이 제공되지 않는 경우 마지막 기록된 점검 시간까지의 기간)(시간 단위)
+Glucose: 혈액 내 포도당 농도를 측정한 혈당 수치(단위: mg/dL 또는 mmol/L).
+Heart.Rate: 분당 심박수(bpm).
+Height: 환자의 키(단위: cm).
+Mean.blood.pressure: 한 번의 심박 주기 동안의 평균 동맥압(단위: mmHg).
+Oxygen.saturation: 혈액 내 총 헤모글로빈 대비 산소가 포화된 헤모글로빈의 비율(%).
+Respiratory.rate: 분당 호흡 수(단위: 호흡/분).
+Temperature: 환자의 체온(단위: °C).
+Weight: 환자의 체중(단위: lbs).
+Glascow.coma.scale.eye.opening: 글래스고 혼수 척도의 눈뜨기 반응 점수(자발적 또는 자극에 의한 눈뜨기를 측정, 범위: 1~4).
+Glascow.coma.scale.verbal.response: 글래스고 혼수 척도의 언어 반응 점수(말하거나 소리를 낼 수 있는 능력을 평가, 범위: 1~5).
+delta: 정확한 퇴원 시간이 기록된 경우 1, 그렇지 않은 경우 0.
+
+****
+```{r}
+fit <- coxph(Surv(futime, delta) ~ Glucose + Heart.Rate + Height + Oxygen.saturation + Respiratory.rate + Temperature + Weight , data = data)
+
+true_beta <- summary(fit)$coefficients[, 1]
+true_beta <- sprintf("%.4f", true_beta)
+data <- list(data)
+```
+
+**ncc and weighted cox**
+```{r warning=FALSE, message=FALSE}
+nested_sampling <- function(data, iter, num_controls_per_failure) {
+  sampled_datasets <- list()
+  
+  for (i in 1:iter) {
+    # 데이터 복사 및 초기화
+    sampling_data <- as.data.frame(data[[i]])
+    sampling_data$index <- 1:nrow(sampling_data)
+    sampling_data$Glucose <- NA           # 모든 관측치의 Glucose을 NA로 초기화
+    sampling_data$case <- 0          # 사례 여부를 나타내는 변수 초기화 (0: 대조군, 1: 사례)
+    sampling_data$weight <- 0        # 가중치 초기화
+    
+    # 사건(event) 인덱스 찾기
+    event_indices <- which(sampling_data$delta == 1)
+    
+    for (j in seq_along(event_indices)) {
+      case_index <- event_indices[j]
+      t_i <- sampling_data$futime[case_index]
+      
+      # 시간 t_i에서의 위험 집합 (futime >= t_i)
+      risk_set_indices <- which(sampling_data$futime >= t_i)
+      risk_set_indices <- setdiff(risk_set_indices, case_index)  # 사례 제외
+      
+      total_controls <- length(risk_set_indices)  # 전체 위험 집합 내 대조군 수
+      
+      # 대조군 샘플링
+      if (total_controls >= num_controls_per_failure) {
+        sampled_controls <- sample(risk_set_indices, num_controls_per_failure, replace = FALSE)
+        weight_controls <- total_controls / num_controls_per_failure  # 대조군 가중치
+      } else if (total_controls > 0) {
+        sampled_controls <- risk_set_indices
+        weight_controls <- 1  # 대조군이 충분하지 않은 경우 가중치 설정
+      } else {
+        next  # 대조군이 없는 경우 다음 사건으로 이동
+      }
+      
+      # 사례와 대조군의 Glucose 값 설정
+      indices <- c(case_index, sampled_controls)
+      sampling_data$Glucose[indices] <- data[[i]]$Glucose[indices]
+      
+      # 사례 및 대조군 플래그 설정
+      sampling_data$case[case_index] <- 1
+      sampling_data$case[sampled_controls] <- 0
+      
+      # 가중치 설정
+      sampling_data$weight[case_index] <- 1  # 사례의 가중치
+      sampling_data$weight[sampled_controls] <- weight_controls  # 대조군의 가중치
+    }
+    
+    sampled_datasets[[i]] <- sampling_data
+  }
+  
+  return(sampled_datasets)
+}
+
+weighted_coxph <- function(sampled_data) {
+  beta_estimates <- matrix(NA, nrow = length(sampled_data), ncol = 7)
+  se_estimates <- matrix(NA, nrow = length(sampled_data), ncol = 7)
+  
+  for (i in 1:length(sampled_data)) {
+    case_control_data <- sampled_data[[i]]
+    if (nrow(case_control_data) > 0 && length(unique(case_control_data$case)) > 1) {
+      cox_model <- tryCatch(
+        coxph(Surv(futime, delta) ~ Glucose + Heart.Rate + Height + Oxygen.saturation + 
+                Respiratory.rate + Temperature + Weight,
+              data = case_control_data, weights = weight, method = "breslow"),
+        error = function(e) NULL
+      )
+      
+      if (!is.null(cox_model)) {
+        beta_estimates[i, ] <- coef(cox_model)
+        se_estimates[i, ] <- sqrt(diag(vcov(cox_model)))
+      }
+    }
+  }
+  
+  colnames(beta_estimates) <- c("Beta1", "Beta2", "Beta3","Beta4", "Beta5", "Beta6","Beta7")
+  colnames(se_estimates) <- c("Beta1_SE", "Beta2_SE", "Beta3_SE", "Beta4_SE", "Beta5_SE", 
+                              "Beta6_SE", "Beta7_SE")
+  
+  return(list(
+    beta_estimates = beta_estimates,
+    se_estimates = se_estimates,
+    sampled_datasets = sampled_data # 추가
+  ))
+}
+
+result_function <- function(sample, beta_estimates, se_estimates) {
+  
+
+  result1 <- data.frame(
+    true_beta = true_beta,
+    Beta = sprintf("%.4f", beta_estimates),
+    SE = sprintf("%.4f", se_estimates)
+  )
+  
+  result1 <- t(result1)
+  
+  bias <- as.numeric(result1["true_beta", ]) - as.numeric(result1["Beta", ])
+  
+  # Bias 행 추가
+  result1 <- rbind(result1, Bias = sprintf("%.4f", bias))
+  
+  # Bias 행을 Beta_Mean 아래로 이동
+  result1 <- result1[c(1:2, nrow(result1), 3:(nrow(result1) - 1)), ]
+  
+  
+  # 샘플 실패 수와 샘플 크기의 평균 계산
+  sample_failure_count <- (sum(sample$sampled_datasets.case == 1))
+  sample_size <- (sum(sample$sampled_datasets.weight != 0))
+
+  
+  result2 <- data.frame(
+    Mean_Failures_in_Sample = mean(sample_failure_count, na.rm = TRUE),
+    Mean_Sample_Size = mean(sample_size, na.rm = TRUE)
+  )
+  
+  return(list(result1 = result1,
+              result2 = result2))
+}
+
+nested_sampling_data_1 <- nested_sampling(data = data, iter = 1, num_controls_per_failure = 5)
+weighted_coxph_1 <- weighted_coxph(sampled_data = nested_sampling_data_1)
+result_1_sample <- as.data.frame(weighted_coxph_1[3])
+result_1 <- result_function(sample = result_1_sample, 
+                            beta_estimates = as.data.frame(weighted_coxph_1[1]), 
+                            se_estimates = as.data.frame(weighted_coxph_1[2]) )
+
+print(result_1)
+```
+**mi**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+
+# 2. Multiple Imputation 함수 (수정됨)
+multiple_imputation <- function(sampled_data, m, max_attempts = 1000) {
+  imputed_datasets <- list()
+  row_counter <- 1  # imputed_datasets 리스트에 대한 인덱스
+  sample_failure_count <- numeric(length = length(sampled_data) * m)
+  sample_size <- numeric(length = length(sampled_data) * m)
+  
+  for (i in 1:length(sampled_data)) {
+    case_control_data <- sampled_data[[i]]
+    
+    # Cox 모델 적합 (가중치 사용)
+    if (nrow(case_control_data) > 0 && length(unique(case_control_data$case)) > 1) {
+      cox_model <- tryCatch(
+        coxph(Surv(futime, delta) ~ Glucose + Heart.Rate + Height + Oxygen.saturation + 
+                Respiratory.rate + Temperature + Weight, data = case_control_data, weights = weight, method = "breslow"),
+        error = function(e) {
+          message(paste("Cox model failed for dataset", i, ":", e$message))
+          return(NULL)
+        }
+      )
+      
+      if (!is.null(cox_model)) {
+        # 베타 추정치 추출
+        beta_estimates_iter <- coef(cox_model)
+        
+        # Baseline 누적위험 함수 추정
+        base_haz <- basehaz(cox_model, centered = FALSE)
+        
+        # 특정 시간 t에 대한 H0(t)를 반환하는 함수 정의
+        get_H0 <- function(t, base_haz) {
+          if (t < min(base_haz$time)) {
+            return(0)
+          } else {
+            return(max(base_haz$hazard[base_haz$time <= t]))
+          }
+        }
+
+	observed_data <- case_control_data[!is.na(case_control_data$Glucose),]
+        
+        # 회귀모형 적합: Z1 ~ Z2 + W1 + W2
+        lm_fit <- lm(Glucose ~  Mean.blood.pressure  + Heart.Rate + Height + Oxygen.saturation + 
+                Respiratory.rate + Temperature + Weight, data = observed_data)
+        coefs <- coef(lm_fit) 
+        sigma_res <- summary(lm_fit)$sigma  # 잔차 표준편차
+        
+        
+        # m번의 다중대체 수행
+        for (j in 1:m) {
+          # 원본 샘플링 데이터 복사
+          imputed_data <- case_control_data
+          
+          # 결측치 인덱스 찾기
+          missing_indices <- which(is.na(imputed_data$Glucose))
+          
+          for (k in missing_indices) {
+            futime_k <- imputed_data$futime[k]
+            Heart.Rate_k <- imputed_data$Heart.Rate[k]
+            Height_k <- imputed_data$Height[k]
+            Mean.blood.pressure_k <- imputed_data$Mean.blood.pressure[k]
+            Oxygen.saturation_k <- imputed_data$Oxygen.saturation[k]
+            Respiratory.rate_k <- imputed_data$Respiratory.rate[k]
+            Temperature_k <- imputed_data$Temperature[k]
+            Weight_k <- imputed_data$Weight[k]
+
+            # H0(futime_k) 계산
+            H0_futime_k <- get_H0(futime_k, base_haz)
+            
+            accepted <- FALSE
+            attempts <- 0
+            while (!accepted && attempts < max_attempts) {
+              attempts <- attempts + 1
+              # Glucose_star 샘플링 (표준 정규 분포)
+              mean_Glucose_given <- coefs[1] + coefs["Mean.blood.pressure"] * Mean.blood.pressure_k+ 
+						coefs["Heart.Rate"] *Heart.Rate_k + 
+						coefs["Height"] *Height_k+ 
+						coefs["Oxygen.saturation"] *Oxygen.saturation_k+ 
+						coefs["Respiratory.rate"] *Respiratory.rate_k+ 
+						coefs["Temperature"] *Temperature_k +
+						coefs["Weight"] *Weight_k
+		Glucose_star <- rnorm(1, mean = mean_Glucose_given, sd = sigma_res)
+              
+              # 선형 예측자 계산
+              lp <- beta_estimates_iter["Glucose"] * Glucose_star + 
+                    beta_estimates_iter["Heart.Rate"] * Heart.Rate_k + 
+                    beta_estimates_iter["Height"] * Height_k +
+                    beta_estimates_iter["Oxygen.saturation"] * Oxygen.saturation_k + 
+                    beta_estimates_iter["Respiratory.rate"] * Respiratory.rate_k + 
+                    beta_estimates_iter["Temperature"] * Temperature_k +
+                    beta_estimates_iter["Weight"] * Weight_k
+              
+              # 수락 확률 계산
+              acceptance_prob <- exp(- H0_futime_k * exp(lp))
+              
+              # U ~ Uniform(0,1) 샘플링
+              U <- runif(1)
+              
+              if (U <= acceptance_prob) {
+                imputed_data$Glucose[k] <- Glucose_star
+                accepted <- TRUE
+              }
+            }
+            
+            # 최대 시도 횟수 초과 시 기본값 할당
+            if (!accepted) {
+              imputed_data$Glucose[k] <- mean(as.data.frame(nested_sampling_data_1[1])$Glucose, na.rm = TRUE)  
+              message(paste("Mafutimemum attempts reached for imputation in dataset", i, "row", k))
+            }
+          }
+          
+          # 샘플 실패 수 및 샘플 크기 기록
+          sample_failure_count[row_counter] <- sum(imputed_data$case == 1)
+          sample_size[row_counter] <- nrow(imputed_data)
+          
+          # 임퓨테이션된 데이터를 리스트에 추가
+          imputed_datasets[[row_counter]] <- imputed_data
+          row_counter <- row_counter + 1
+        }
+      }
+    }
+  }
+  
+  return(list(
+    imputed_datasets = imputed_datasets,
+    sample_failure_count = sample_failure_count,
+    sample_size = sample_size
+  ))
+}
+
+# 3. Cox 모델 적합 함수 (단순화됨)
+coxph_function <- function(imputed_data_list) {
+  # imputed_data_list: multiple_imputation 함수의 출력 중 imputed_datasets 리스트
+  
+  # 베타 추정치와 표준 오차를 저장할 매트릭스 초기화
+  num_models <- length(imputed_data_list)
+  beta_estimates <- matrix(NA, nrow = num_models, ncol = 7)
+  se_estimates <- matrix(NA, nrow = num_models, ncol = 7)
+  
+  # 매트릭스 컬럼 이름 설정
+  
+  colnames(beta_estimates) <- c("Beta1", "Beta2", "Beta3","Beta4", "Beta5", "Beta6","Beta7")
+  colnames(se_estimates) <- c("Beta1_SE", "Beta2_SE", "Beta3_SE", "Beta4_SE", "Beta5_SE", 
+                              "Beta6_SE", "Beta7_SE")
+  
+  for (i in 1:num_models) {
+    imputed_data <- imputed_data_list[[i]]
+    
+    # Cox 비례 위험 모델 적합 (가중치 없이 적합)
+    if (nrow(imputed_data) > 0 && length(unique(imputed_data$case)) > 1) {
+      cox_model <- tryCatch(
+        coxph(Surv(futime) ~ Glucose + Heart.Rate + Height + Oxygen.saturation + 
+                Respiratory.rate + Temperature + Weight, data = imputed_data, method = "breslow"),
+        error = function(e) {
+          message(paste("Cox model failed for imputed dataset", i, ":", e$message))
+          return(NULL)
+        }
+      )
+      
+      if (!is.null(cox_model)) {
+        # 베타 추정치 저장
+        beta_estimates[i, ] <- coef(cox_model)
+        
+        # 표준 오차 추출 및 저장
+        se_estimates[i, ] <- sqrt(diag(vcov(cox_model)))
+      }
+    }
+  }
+  
+  return(list(
+    beta_estimates = beta_estimates,
+    se_estimates = se_estimates
+  ))
+}
+
+process_beta_data <- function(beta_estimates, se_estimates, true_beta) {
+  # 각 매트릭스의 열별 평균, 표준편차 계산
+  beta_mean <- colMeans(beta_estimates)
+  beta_sd <- apply(beta_estimates, 2, sd)
+  se_mean <- colMeans(se_estimates)
+  
+  # 데이터프레임으로 결과 정리
+  result <- data.frame(
+    Beta_Mean = sprintf("%.4f", beta_mean),
+    Beta_SD = sprintf("%.4f", beta_sd),
+    SE_Mean = sprintf("%.4f", se_mean)
+  )
+  
+  # 데이터프레임을 전치 후, true_beta 추가
+  result <- t(result)
+  result <- as.data.frame(rbind(true_beta, result))
+  
+  # Bias 계산
+  bias <- as.numeric(result["true_beta", ]) - as.numeric(result["Beta_Mean", ])
+  
+  # Bias 행 추가
+  result <- rbind(result, Bias = sprintf("%.4f", bias))
+  
+  # Bias 행을 Beta_Mean 아래로 이동
+  result <- result[c(1:2, nrow(result), 3:(nrow(result) - 1)), ]
+  
+  return(result)
+}
+
+# 수정된 함수 실행
+mi_1 <- multiple_imputation(sampled_data = nested_sampling_data_1, m = 5)
+cox_1 <- coxph_function(imputed_data_list = mi_1$imputed_datasets)
+
+# true_beta는 사용자가 정의한 값이어야 합니다.
+result <- process_beta_data(as.data.frame(cox_1[1]), as.data.frame(cox_1[2]), true_beta = true_beta)
+
+# 결과 확인
+print(result)
+```
+1:1
+```{r warning=FALSE, message=FALSE}
+nested_sampling_data_1 <- nested_sampling(data = data, iter = 1, num_controls_per_failure = 1)
+weighted_coxph_1 <- weighted_coxph(sampled_data = nested_sampling_data_1)
+result_1_sample <- as.data.frame(weighted_coxph_1[3])
+result_1 <- result_function(sample = result_1_sample, 
+                            beta_estimates = as.data.frame(weighted_coxph_1[1]), 
+                            se_estimates = as.data.frame(weighted_coxph_1[2]) )
+print(result_1)
+
+mi_1 <- multiple_imputation(sampled_data = nested_sampling_data_1, m = 5)
+cox_1 <- coxph_function(imputed_data_list = mi_1$imputed_datasets)
+result <- process_beta_data(as.data.frame(cox_1[1]), as.data.frame(cox_1[2]), true_beta = true_beta)
+print(result)
+```
+```{r}
+dat <- as.data.frame(data[1])
+people1 <- as.numeric(dat[7,])
+people2 <- as.numeric(dat[9,])
+true_beta <- as.numeric(true_beta)
+
+full_data_HR <- (exp(people1[2]*true_beta[1] + people1[3]*true_beta[2] + people1[4]*true_beta[3] +
+                       people1[6]*true_beta[4] + people1[7]*true_beta[5] + people1[8]*true_beta[6] +
+                       people1[9]*true_beta[7])) / 
+  (exp(people2[2]*true_beta[1] + people2[3]*true_beta[2] + people2[4]*true_beta[3] +
+                       people2[6]*true_beta[4] + people2[7]*true_beta[5] + people2[8]*true_beta[6] +
+                       people2[9]*true_beta[7]))
+
+mi_beta <- as.numeric(result[2,])
+
+mi_data_HR <- (exp(people1[2]*mi_beta[1] + people1[3]*mi_beta[2] + people1[4]*mi_beta[3] +
+                       people1[6]*mi_beta[4] + people1[7]*mi_beta[5] + people1[8]*mi_beta[6] +
+                       people1[9]*mi_beta[7])) / 
+  (exp(people2[2]*mi_beta[1] + people2[3]*mi_beta[2] + people2[4]*mi_beta[3] +
+                       people2[6]*mi_beta[4] + people2[7]*mi_beta[5] + people2[8]*mi_beta[6] +
+                       people2[9]*mi_beta[7]))
+
+dat[7,]
+dat[9,]
+full_data_HR
+mi_data_HR
+
+
+dat <- as.data.frame(data[1])
+people1 <- as.numeric(dat[9,])
+people1[2] <- 67.35
+people2 <- as.numeric(dat[9,])
+true_beta <- as.numeric(true_beta)
+
+
+full_data_HR <- (exp(people1[2]*true_beta[1] + people1[3]*true_beta[2] + people1[4]*true_beta[3] +
+                       people1[6]*true_beta[4] + people1[7]*true_beta[5] + people1[8]*true_beta[6] +
+                       people1[9]*true_beta[7])) / 
+  (exp(people2[2]*true_beta[1] + people2[3]*true_beta[2] + people2[4]*true_beta[3] +
+                       people2[6]*true_beta[4] + people2[7]*true_beta[5] + people2[8]*true_beta[6] +
+                       people2[9]*true_beta[7]))
+
+mi_beta <- as.numeric(result[2,])
+
+mi_data_HR <- (exp(people1[2]*mi_beta[1] + people1[3]*mi_beta[2] + people1[4]*mi_beta[3] +
+                       people1[6]*mi_beta[4] + people1[7]*mi_beta[5] + people1[8]*mi_beta[6] +
+                       people1[9]*mi_beta[7])) / 
+  (exp(people2[2]*mi_beta[1] + people2[3]*mi_beta[2] + people2[4]*mi_beta[3] +
+                       people2[6]*mi_beta[4] + people2[7]*mi_beta[5] + people2[8]*mi_beta[6] +
+                       people2[9]*mi_beta[7]))
+
+dat[7,]
+dat[9,]
+full_data_HR
+mi_data_HR
+
+
+```
+
+1:3
+```{r warning=FALSE, message=FALSE}
+nested_sampling_data_1 <- nested_sampling(data = data, iter = 1, num_controls_per_failure = 3)
+weighted_coxph_1 <- weighted_coxph(sampled_data = nested_sampling_data_1)
+result_1_sample <- as.data.frame(weighted_coxph_1[3])
+result_1 <- result_function(sample = result_1_sample, 
+                            beta_estimates = as.data.frame(weighted_coxph_1[1]), 
+                            se_estimates = as.data.frame(weighted_coxph_1[2]) )
+print(result_1)
+
+mi_1 <- multiple_imputation(sampled_data = nested_sampling_data_1, m = 5)
+cox_1 <- coxph_function(imputed_data_list = mi_1$imputed_datasets)
+result <- process_beta_data(as.data.frame(cox_1[1]), as.data.frame(cox_1[2]), true_beta = true_beta)
+print(result)
+```
+```{r}
+dat <- as.data.frame(data[1])
+people1 <- as.numeric(dat[7,])
+people2 <- as.numeric(dat[9,])
+true_beta <- as.numeric(true_beta)
+
+full_data_HR <- (exp(people1[2]*true_beta[1] + people1[3]*true_beta[2] + people1[4]*true_beta[3] +
+                       people1[6]*true_beta[4] + people1[7]*true_beta[5] + people1[8]*true_beta[6] +
+                       people1[9]*true_beta[7])) / 
+  (exp(people2[2]*true_beta[1] + people2[3]*true_beta[2] + people2[4]*true_beta[3] +
+                       people2[6]*true_beta[4] + people2[7]*true_beta[5] + people2[8]*true_beta[6] +
+                       people2[9]*true_beta[7]))
+
+mi_beta <- as.numeric(result[2,])
+
+mi_data_HR <- (exp(people1[2]*mi_beta[1] + people1[3]*mi_beta[2] + people1[4]*mi_beta[3] +
+                       people1[6]*mi_beta[4] + people1[7]*mi_beta[5] + people1[8]*mi_beta[6] +
+                       people1[9]*mi_beta[7])) / 
+  (exp(people2[2]*mi_beta[1] + people2[3]*mi_beta[2] + people2[4]*mi_beta[3] +
+                       people2[6]*mi_beta[4] + people2[7]*mi_beta[5] + people2[8]*mi_beta[6] +
+                       people2[9]*mi_beta[7]))
+
+dat[7,]
+dat[9,]
+full_data_HR
+mi_data_HR
+```
+
+1:5
+```{r warning=FALSE, message=FALSE}
+nested_sampling_data_1 <- nested_sampling(data = data, iter = 1, num_controls_per_failure = 5)
+weighted_coxph_1 <- weighted_coxph(sampled_data = nested_sampling_data_1)
+result_1_sample <- as.data.frame(weighted_coxph_1[3])
+result_1 <- result_function(sample = result_1_sample, 
+                            beta_estimates = as.data.frame(weighted_coxph_1[1]), 
+                            se_estimates = as.data.frame(weighted_coxph_1[2]) )
+print(result_1)
+
+mi_1 <- multiple_imputation(sampled_data = nested_sampling_data_1, m = 5)
+cox_1 <- coxph_function(imputed_data_list = mi_1$imputed_datasets)
+result <- process_beta_data(as.data.frame(cox_1[1]), as.data.frame(cox_1[2]), true_beta = true_beta)
+print(result)
+```
+```{r}
+dat <- as.data.frame(data[1])
+people1 <- as.numeric(dat[7,])
+people2 <- as.numeric(dat[9,])
+true_beta <- as.numeric(true_beta)
+
+full_data_HR <- (exp(people1[2]*true_beta[1] + people1[3]*true_beta[2] + people1[4]*true_beta[3] +
+                       people1[6]*true_beta[4] + people1[7]*true_beta[5] + people1[8]*true_beta[6] +
+                       people1[9]*true_beta[7])) / 
+  (exp(people2[2]*true_beta[1] + people2[3]*true_beta[2] + people2[4]*true_beta[3] +
+                       people2[6]*true_beta[4] + people2[7]*true_beta[5] + people2[8]*true_beta[6] +
+                       people2[9]*true_beta[7]))
+
+mi_beta <- as.numeric(result[2,])
+
+mi_data_HR <- (exp(people1[2]*mi_beta[1] + people1[3]*mi_beta[2] + people1[4]*mi_beta[3] +
+                       people1[6]*mi_beta[4] + people1[7]*mi_beta[5] + people1[8]*mi_beta[6] +
+                       people1[9]*mi_beta[7])) / 
+  (exp(people2[2]*mi_beta[1] + people2[3]*mi_beta[2] + people2[4]*mi_beta[3] +
+                       people2[6]*mi_beta[4] + people2[7]*mi_beta[5] + people2[8]*mi_beta[6] +
+                       people2[9]*mi_beta[7]))
+
+dat[7,]
+dat[9,]
+full_data_HR
+mi_data_HR
+```

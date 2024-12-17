@@ -1,0 +1,391 @@
+---
+title: "Final"
+author: "semin"
+date: "2024-12-12"
+output: html_document
+---
+
+**Packages**
+```{r warning=FALSE, message=FALSE}
+library(MASS)
+library(dplyr)
+library(survival)
+```
+
+**Parameter**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+#parameter
+n <- 30000
+rho <- 0.5
+gamma <- 1.5
+beta1 <- log(2)
+beta2 <- log(2)
+beta3 <- -1
+mu <- c(0, 0)
+Sigma <- matrix(c(1, 0.75, 0.75, 1), nrow=2)
+
+lambda_C_values <- c(0.04354819, 0.17181910, 2.90933877, 5.21306138, 9.83879227)
+```
+
+**Generate Dataset**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+lambda_C <- lambda_C_values[5]
+
+simulation2 <- function(iter) {
+  simulated_data_99 <- vector("list", iter) 
+  
+  for (i in 1:iter) {
+    
+    Z <- mvrnorm(n, mu = mu, Sigma = Sigma)
+    Z1 <- Z[,1]
+    Z2 <- Z[,2]
+    W1 <- rnorm(n, 0, 1)
+    W2 <- rbinom(n, 1, 0.5)
+    u <- runif(n)
+    lambda <- exp(beta1 * Z1 + beta2 * W1 + beta3 * W2) * rho
+    Ti <- (-log(1 - u) / lambda)^(1 / gamma)
+    
+    Ci <- rexp(n, rate = lambda_C) 
+    Xi <- pmin(Ti, Ci)
+    Delta <- as.numeric(Ti <= Ci)
+    
+    data <- data.frame(Xi = Xi, Delta = Delta, Z1 = Z1, Z2 = Z2, W1 = W1, W2 = W2)
+    
+    simulated_data_99[[i]] <- data
+  }
+
+  return(simulated_data_99)  
+}
+```
+
+**Nested Case Control Sampling**
+```{r warning=FALSE, message=FALSE}
+lambda_C <- lambda_C_values[5]
+num_pop <- 30000
+
+nested_sampling <- function(data, iter, num_controls_per_failure) {
+  sampled_datasets <- list()
+  
+  for (i in 1:iter) {
+
+    sampling_data <- as.data.frame(data[[i]])
+    sampling_data$index <- 1:nrow(sampling_data)
+    sampling_data$Z1 <- NA           # 모든 관측치의 Z1을 NA로 초기화
+    sampling_data$case <- 0          # 사례 여부를 나타내는 변수 초기화 (0: 대조군, 1: 사례)
+    sampling_data$weight <- 0        # 가중치 초기화
+    
+    # 사건(event) 인덱스 
+    event_indices <- which(sampling_data$Delta == 1)
+    
+    for (j in seq_along(event_indices)) {
+      case_index <- event_indices[j]
+      t_i <- sampling_data$Xi[case_index]
+      
+      # 시간 t_i에서의 위험 집합 (Xi >= t_i)
+      risk_set_indices <- which(sampling_data$Xi >= t_i)
+      risk_set_indices <- setdiff(risk_set_indices, case_index)  # 사례 제외
+      
+      total_controls <- length(risk_set_indices)  # 전체 위험 집합 내 대조군 수
+      
+      # 대조군 샘플링
+      if (total_controls >= num_controls_per_failure) {
+        sampled_controls <- sample(risk_set_indices, num_controls_per_failure, replace = FALSE)
+        weight_controls <- total_controls / num_controls_per_failure  # 대조군 가중치
+      } else if (total_controls > 0) {
+        sampled_controls <- risk_set_indices
+        weight_controls <- 1  # 대조군이 충분하지 않은 경우 가중치 설정
+      } else {
+        next  # 대조군이 없는 경우 다음 사건으로 이동
+      }
+      
+      # 사례와 대조군의 Z1 값 설정
+      indices <- c(case_index, sampled_controls)
+      sampling_data$Z1[indices] <- data[[i]]$Z1[indices]
+      
+      # 사례 및 대조군 플래그 설정
+      sampling_data$case[case_index] <- 1
+      sampling_data$case[sampled_controls] <- 0
+      
+      # 가중치 설정
+      sampling_data$weight[case_index] <- 1  # 사례의 가중치
+      sampling_data$weight[sampled_controls] <- weight_controls  # 대조군의 가중치
+    }
+    
+    sampled_datasets[[i]] <- sampling_data
+  }
+  
+  return(sampled_datasets)
+}
+
+weighted_coxph <- function(sampled_data) {
+  beta_estimates <- matrix(NA, nrow = length(sampled_data), ncol = 3)
+  se_estimates <- matrix(NA, nrow = length(sampled_data), ncol = 3)
+  
+  for (i in 1:length(sampled_data)) {
+    case_control_data <- sampled_data[[i]]
+    if (nrow(case_control_data) > 0 && length(unique(case_control_data$case)) > 1) {
+      cox_model <- tryCatch(
+        coxph(Surv(Xi, Delta) ~ Z1 + W1 + W2, data = case_control_data, weights = weight, method = "breslow"),
+        error = function(e) NULL
+      )
+      
+      if (!is.null(cox_model)) {
+        beta_estimates[i, ] <- coef(cox_model)
+        se_estimates[i, ] <- sqrt(diag(vcov(cox_model)))
+      }
+    }
+  }
+  
+  colnames(beta_estimates) <- c("Beta1", "Beta2", "Beta3")
+  colnames(se_estimates) <- c("Beta1_SE", "Beta2_SE", "Beta3_SE")
+  
+  return(list(
+    beta_estimates = beta_estimates,
+    se_estimates = se_estimates,
+    sampled_datasets = sampled_data
+  ))
+}
+
+result_function <- function(beta_results) {
+ 
+  beta_estimates <- beta_results$beta_estimates
+  se_estimates <- beta_results$se_estimates
+  sampled_datasets <- beta_results$sampled_datasets
+  
+  # Beta 추정치의 평균과 표준편차 계산
+  beta_means <- colMeans(beta_estimates, na.rm = TRUE)
+  beta_sds <- apply(beta_estimates, 2, sd, na.rm = TRUE)
+  
+  # 표준 오차의 평균 계산
+  se_means <- colMeans(se_estimates, na.rm = TRUE)
+  
+  # 바이어스 계산
+  results1 <- data.frame(
+    True_Beta = c(beta1, beta2, beta3),
+    Mean_Estimated_Beta = round(beta_means, 4),
+    Bias = c(round(beta_means[1] - beta1, 4),
+             round(beta_means[2] - beta2, 4),
+             round(beta_means[3] - beta3, 4)),
+    Mean_SE = round(se_means, 4),
+    SD_Estimated_Beta = round(beta_sds, 4)
+  )
+  rownames(results1) <- c("Beta1", "Beta2", "Beta3")
+  
+  # 샘플 실패 수와 샘플 크기의 평균 계산
+  sample_failure_count <- sapply(sampled_datasets, function(x) sum(x$case == 1))
+  sample_size <- sapply(sampled_datasets, function(x) sum(x$weight != 0))
+  
+  results2 <- data.frame(
+    Mean_Failures_in_Sample = mean(sample_failure_count, na.rm = TRUE),
+    Mean_Sample_Size = mean(sample_size, na.rm = TRUE)
+  )
+  
+  return(list(
+    results1 = results1,
+    results2 = results2
+  ))
+}
+```
+
+**Multiple Imputation**
+```{r warning=FALSE, message=FALSE}
+multiple_imputation <- function(sampled_data, m, max_attempts = 100) {
+  imputed_datasets <- list()
+  row_counter <- 1  
+  sample_failure_count <- numeric(length = length(sampled_data) * m)
+  sample_size <- numeric(length = length(sampled_data) * m)
+  
+  for (i in 1:length(sampled_data)) {
+    case_control_data <- sampled_data[[i]]
+    
+    # Cox 모델 적합 (가중치 사용)
+    if (nrow(case_control_data) > 0 && length(unique(case_control_data$case)) > 1) {
+      cox_model <- tryCatch(
+        coxph(Surv(Xi, Delta) ~ Z1 + W1 + W2, data = case_control_data, weights = weight, method = "breslow"),
+        error = function(e) {
+          message(paste("Cox model failed for dataset", i, ":", e$message))
+          return(NULL)
+        }
+      )
+      
+      if (!is.null(cox_model)) {
+
+        beta_estimates_iter <- coef(cox_model)
+        base_haz <- basehaz(cox_model, centered = FALSE)
+        
+        # 특정 시간 t에 대한 H0(t)를 반환하는 함수 
+        get_H0 <- function(t, base_haz) {
+          if (t < min(base_haz$time)) {
+            return(0)
+          } else {
+            return(max(base_haz$hazard[base_haz$time <= t]))
+          }
+        }
+
+	observed_data <- case_control_data[!is.na(case_control_data$Z1),]
+        
+        # 회귀모형 적합: Z1 ~ Z2 + W1 + W2
+        lm_fit <- lm(Z1 ~ Z2 + W1 + W2, data = observed_data)
+        coefs <- coef(lm_fit) 
+        sigma_res <- summary(lm_fit)$sigma  # 잔차 표준편차
+        
+        # m번의 다중대체 수행
+        for (j in 1:m) {
+          # 원본 샘플링 데이터 복사
+          imputed_data <- case_control_data
+          
+          # 결측치 인덱스
+          missing_indices <- which(is.na(imputed_data$Z1))
+          
+          for (k in missing_indices) {
+            W1_k <- imputed_data$W1[k]
+            W2_k <- imputed_data$W2[k]
+            Xi_k <- imputed_data$Xi[k]
+            Z2_k <- imputed_data$Z2[k]
+            
+            # H0(Xi_k) 계산
+            H0_Xi_k <- get_H0(Xi_k, base_haz)
+            
+            accepted <- FALSE
+            attempts <- 0
+            while (!accepted && attempts < max_attempts) {
+              attempts <- attempts + 1
+              # Z1_star 샘플링 
+              mean_Z1_given <- coefs[1] + coefs["Z2"] * Z2_k + coefs["W1"] * W1_k + coefs["W2"] * W2_k
+              Z1_star <- rnorm(1, mean = mean_Z1_given, sd = sigma_res)
+              
+              # 선형 예측자 계산
+              lp <- beta_estimates_iter["Z1"] * Z1_star + 
+                    beta_estimates_iter["W1"] * W1_k + 
+                    beta_estimates_iter["W2"] * W2_k 
+              
+              # 수락 확률 계산
+              acceptance_prob <- exp(- H0_Xi_k * exp(lp))
+              
+              # U ~ Uniform(0,1) 샘플링
+              U <- runif(1)
+              
+              if (U <= acceptance_prob) {
+                imputed_data$Z1[k] <- Z1_star
+                accepted <- TRUE
+              }
+            }
+            
+            # 최대 시도 횟수 초과 시 평균 할당
+            if (!accepted) {
+              imputed_data$Z1[k] <- mean_Z1_given 
+              message(paste("Maximum attempts reached for imputation in dataset", i, "row", k))
+            }
+          }
+          
+          # 샘플 실패 수 및 샘플 크기 
+          sample_failure_count[row_counter] <- sum(imputed_data$case == 1)
+          sample_size[row_counter] <- nrow(imputed_data)
+
+          imputed_datasets[[row_counter]] <- imputed_data
+          row_counter <- row_counter + 1
+        }
+      }
+    }
+  }
+  
+  return(list(
+    imputed_datasets = imputed_datasets,
+    sample_failure_count = sample_failure_count,
+    sample_size = sample_size
+  ))
+}
+coxph_function <- function(imputed_data_list) {
+
+  num_models <- length(imputed_data_list)
+  beta_estimates <- matrix(NA, nrow = num_models, ncol = 3)
+  se_estimates <- matrix(NA, nrow = num_models, ncol = 3)
+
+  colnames(beta_estimates) <- c("Beta1", "Beta2", "Beta3")
+  colnames(se_estimates) <- c("Beta1_SE", "Beta2_SE", "Beta3_SE")
+  
+  for (i in 1:num_models) {
+    imputed_data <- imputed_data_list[[i]]
+    
+    # Cox 비례 위험 모델 적합 
+    if (nrow(imputed_data) > 0 && length(unique(imputed_data$case)) > 1) {
+      cox_model <- tryCatch(
+        coxph(Surv(Xi, Delta) ~ Z1 + W1 + W2, data = imputed_data, method = "breslow"),
+        error = function(e) {
+          message(paste("Cox model failed for imputed dataset", i, ":", e$message))
+          return(NULL)
+        }
+      )
+      
+      if (!is.null(cox_model)) {
+
+        beta_estimates[i, ] <- coef(cox_model)
+        se_estimates[i, ] <- sqrt(diag(vcov(cox_model)))
+      }
+    }
+  }
+  
+  return(list(
+    beta_estimates = beta_estimates,
+    se_estimates = se_estimates
+  ))
+}
+
+```
+
+**Dataset = 1000**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+simulated_data_1000 <- simulation2(1000)
+```
+**1:1**  
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+sampling_1000_1 <- nested_sampling(data = simulated_data_1000, iter = 1000, num_controls_per_failure = 1)
+weighted_coxph_1000_1 <- weighted_coxph(sampled_data = sampling_1000_1)
+result_1000_1 <- result_function(beta_results = weighted_coxph_1000_1)
+print(result_1000_1)
+```
+**mi=10**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+mi_1000_1_10 <- multiple_imputation(sampled_data = sampling_1000_1, m = 10)
+cox_1000_1_10 <- coxph_function(imputed_data_list = mi_1000_1_10$imputed_datasets)
+result_1000_1_10 <- result_function(beta_results = cox_1000_1_10)
+print(result_1000_1_10$results1)
+```
+**1:3**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+sampling_1000_3 <- nested_sampling(data = simulated_data_1000, iter = 1000, num_controls_per_failure = 3)
+weighted_coxph_1000_3 <- weighted_coxph(sampled_data = sampling_1000_3)
+result_1000_3 <- result_function(beta_results = weighted_coxph_1000_3)
+print(result_1000_3)
+```
+**mi=10**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+mi_1000_3_10 <- multiple_imputation(sampled_data = sampling_1000_3, m = 10)
+cox_1000_3_10 <- coxph_function(imputed_data_list = mi_1000_3_10$imputed_datasets)
+result_1000_3_10 <- result_function(beta_results = cox_1000_3_10)
+print(result_1000_3_10$results1)
+```
+
+**1:5**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+sampling_1000_5 <- nested_sampling(data = simulated_data_1000, iter = 1000, num_controls_per_failure = 5)
+weighted_coxph_1000_5 <- weighted_coxph(sampled_data = sampling_1000_5)
+result_1000_5 <- result_function(beta_results = weighted_coxph_1000_5)
+print(result_1000_5)
+```
+**mi=10**
+```{r warning=FALSE, message=FALSE}
+set.seed(2024311134)
+mi_1000_5_10 <- multiple_imputation(sampled_data = sampling_1000_5, m = 10)
+cox_1000_5_10 <- coxph_function(imputed_data_list = mi_1000_5_10$imputed_datasets)
+result_1000_5_10 <- result_function(beta_results = cox_1000_5_10)
+print(result_1000_5_10$results1)
+```
